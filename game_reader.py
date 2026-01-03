@@ -5,122 +5,111 @@ import sys
 from PIL import Image
 import pytesseract
 import io
+import difflib
+import signal
+import threading
+import evdev
 
-# Configuration
-CHECK_INTERVAL = 2  # Temps en secondes entre chaque lecture
-MIN_TEXT_LENGTH = 5 # Ignorer les textes trop courts
-LANG = 'fra'        # Langue pour l'OCR
+# --- CONFIGURATION ---
+CHECK_INTERVAL = 1.5
+MIN_TEXT_LENGTH = 3
+LANG = 'fra'
+SIMILARITY_THRESHOLD = 0.5
+CONTROLLER_PATH = '/dev/input/event17' # Votre Zikway HID gamepad
+TOGGLE_BUTTON_CODE = 314               # Le bouton que vous avez choisi
+# ---------------------
+
+PAUSED = False
+
+def toggle_pause():
+    global PAUSED
+    PAUSED = not PAUSED
+    if PAUSED:
+        print(">>> PAUSE ACTIVÉE", flush=True)
+        subprocess.Popen(['espeak-ng', '-v', 'fr', 'Pause'])
+    else:
+        print(">>> LECTURE ACTIVÉE", flush=True)
+        subprocess.Popen(['espeak-ng', '-v', 'fr', 'Lecture activée'])
+
+def controller_listener():
+    """Écoute la manette en arrière-plan."""
+    try:
+        device = evdev.InputDevice(CONTROLLER_PATH)
+        print(f"Écoute de la manette : {device.name}", flush=True)
+        for event in device.read_loop():
+            if event.type == evdev.ecodes.EV_KEY:
+                if event.code == TOGGLE_BUTTON_CODE and event.value == 1: # 1 = pressé
+                    toggle_pause()
+    except Exception as e:
+        print(f"Erreur manette : {e}", flush=True)
 
 def get_active_monitor_geometry():
-    """Récupère la géométrie de l'écran actif via hyprctl."""
     try:
-        # Récupérer les infos des moniteurs au format JSON
         result = subprocess.run(['hyprctl', 'monitors', '-j'], capture_output=True, text=True)
         monitors = json.loads(result.stdout)
-        
-        # Trouver le moniteur focalisé
-        for monitor in monitors:
-            if monitor['focused']:
-                return {
-                    'x': monitor['x'],
-                    'y': monitor['y'],
-                    'width': monitor['width'],
-                    'height': monitor['height'],
-                    'scale': monitor['scale']
-                }
-        # Fallback si aucun focus trouvé (prendre le premier)
-        if monitors:
-             return {
-                    'x': monitors[0]['x'],
-                    'y': monitors[0]['y'],
-                    'width': monitors[0]['width'],
-                    'height': monitors[0]['height'],
-                    'scale': monitors[0]['scale']
-                }
+        for m in monitors:
+            if m['focused']:
+                return m
+        return monitors[0] if monitors else None
     except Exception as e:
-        print(f"Erreur lors de la récupération de la géométrie écran: {e}")
         return None
 
-def capture_bottom_half(geometry):
-    """Capture la moitié inférieure de l'écran."""
-    # Calcul de la zone (Moitié inférieure)
-    # X, Y, Width, Height
-    # On commence à Y + Height/2
-    
-    x = geometry['x']
-    y = geometry['y'] + (geometry['height'] // 2)
-    w = geometry['width']
-    h = geometry['height'] // 2
-    
-    region = f"{x},{y} {w}x{h}"
-    
+def capture_bottom_half(geo):
+    x = geo['x']
+    y = geo['y'] + (geo['height'] // 2)
+    w = geo['width']
+    h = geo['height'] // 2
+    region = f"{int(x)},{int(y)} {int(w)}x{int(h)}"
     try:
-        # Utilisation de grim pour capturer une région spécifique
-        # grim -g "x,y wxH" -
         cmd = ['grim', '-g', region, '-t', 'png', '-']
-        result = subprocess.run(cmd, capture_output=True)
-        
-        if result.returncode != 0:
-            print("Erreur grim:", result.stderr)
-            return None
-            
-        return Image.open(io.BytesIO(result.stdout))
-    except Exception as e:
-        print(f"Erreur capture: {e}")
-        return None
+        res = subprocess.run(cmd, capture_output=True)
+        if res.returncode == 0:
+            return Image.open(io.BytesIO(res.stdout))
+    except:
+        pass
+    return None
 
 def speak(text):
-    """Prononce le texte via espeak."""
     try:
-        # On utilise espeak-ng. 
-        # -v fr: voix française
-        # -s 150: vitesse un peu plus rapide (défaut ~175, 150 est plus calme)
-        subprocess.Popen(['espeak-ng', '-v', 'fr', '-s', '150', text])
-    except Exception as e:
-        print(f"Erreur audio: {e}")
-
-def clean_text(text):
-    """Nettoie le texte (enlève les sauts de ligne inutiles)."""
-    # Remplace les retours à la ligne par des espaces et nettoie les espaces multiples
-    return " ".join(text.split())
+        print(f"PARLE: {text}", flush=True)
+        subprocess.run(['espeak-ng', '-v', 'fr', '-s', '160', text])
+    except:
+        pass
 
 def main():
-    print("=== GameReader Démarré ===")
-    print("Lecture de la moitié inférieure de l'écran...")
-    print("Appuyez sur Ctrl+C pour arrêter.")
+    print("=== GAMEREADER AVEC MANETTE ===", flush=True)
+    
+    # Lancement de l'écoute manette dans un thread séparé
+    thread = threading.Thread(target=controller_listener, daemon=True)
+    thread.start()
     
     last_text = ""
     
     try:
         while True:
+            if PAUSED:
+                time.sleep(0.5)
+                continue
+
             geo = get_active_monitor_geometry()
             if not geo:
-                print("Impossible de détecter l'écran. Nouvelle tentative...")
-                time.sleep(2)
+                time.sleep(1)
                 continue
                 
-            image = capture_bottom_half(geo)
-            
-            if image:
-                # Pré-traitement optionnel (conversion niveau de gris pour meilleur OCR)
-                image = image.convert('L') 
+            img = capture_bottom_half(geo)
+            if img:
+                text = pytesseract.image_to_string(img.convert('L'), lang=LANG)
+                cleaned = " ".join(text.split())
                 
-                # OCR
-                text = pytesseract.image_to_string(image, lang=LANG)
-                cleaned = clean_text(text)
-                
-                if len(cleaned) > MIN_TEXT_LENGTH:
-                    # On compare avec le dernier texte lu pour éviter la répétition
-                    # On utilise un ratio de similarité simple ou juste l'égalité exacte
-                    if cleaned != last_text:
-                        print(f"Lu : {cleaned}")
+                if len(cleaned) >= MIN_TEXT_LENGTH:
+                    sim = difflib.SequenceMatcher(None, last_text, cleaned).ratio()
+                    if sim < SIMILARITY_THRESHOLD:
                         speak(cleaned)
                         last_text = cleaned
             
             time.sleep(CHECK_INTERVAL)
-            
     except KeyboardInterrupt:
-        print("\nArrêt du programme.")
+        print("Arrêt.")
 
 if __name__ == "__main__":
     main()
