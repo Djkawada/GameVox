@@ -9,6 +9,9 @@ import difflib
 import signal
 import threading
 import evdev
+import re
+import os
+from gtts import gTTS
 
 # --- CONFIGURATION ---
 CHECK_INTERVAL = 1.5
@@ -69,12 +72,29 @@ def capture_bottom_half(geo):
         pass
     return None
 
+def clean_text(text):
+    # Remplace les retours à la ligne par des espaces
+    text = text.replace('\n', ' ')
+    # Garde uniquement lettres, accents, ponctuation de base
+    # On enlève les chiffres (0-9) comme demandé
+    text = re.sub(r'[^a-zA-ZàâäéèêëîïôöùûüçÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ\s.,!?:;\'"-]', ' ', text)
+    # Réduit les espaces multiples
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
 def speak(text):
-    try:
-        print(f"PARLE: {text}", flush=True)
-        subprocess.run(['espeak-ng', '-v', 'fr', '-s', '160', text])
-    except:
-        pass
+    def _speak_thread(t):
+        try:
+            print(f"PARLE: {t}", flush=True)
+            tts = gTTS(text=t, lang='fr')
+            filename = f"/tmp/gamereader_{int(time.time())}.mp3"
+            tts.save(filename)
+            subprocess.run(['mpv', '--no-terminal', filename])
+            os.remove(filename)
+        except Exception as e:
+            print(f"Erreur TTS: {e}", flush=True)
+
+    threading.Thread(target=_speak_thread, args=(text,), daemon=True).start()
 
 def main():
     print("=== GAMEREADER AVEC MANETTE ===", flush=True)
@@ -99,7 +119,7 @@ def main():
             img = capture_bottom_half(geo)
             if img:
                 text = pytesseract.image_to_string(img.convert('L'), lang=LANG)
-                cleaned = " ".join(text.split())
+                cleaned = clean_text(text)
                 
                 if len(cleaned) >= MIN_TEXT_LENGTH:
                     sim = difflib.SequenceMatcher(None, last_text, cleaned).ratio()
