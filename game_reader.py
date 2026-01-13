@@ -46,6 +46,15 @@ def save_profile(name, region):
     with open(PROFILES_FILE, 'w') as f:
         json.dump(profiles, f, indent=4)
 
+def delete_profile(name):
+    profiles = load_profiles()
+    if name in profiles:
+        del profiles[name]
+        with open(PROFILES_FILE, 'w') as f:
+            json.dump(profiles, f, indent=4)
+        return True
+    return False
+
 def select_zone_with_slurp():
     print("Sélectionnez une zone à l'écran avec votre souris...", flush=True)
     try:
@@ -76,7 +85,12 @@ def choose_profile_menu():
             print(f"{idx}. Profil : {name}")
             idx += 1
             
-        print(f"{idx}. Créer un nouveau profil")
+        create_idx = idx
+        print(f"{create_idx}. Créer un nouveau profil")
+        
+        delete_idx = idx + 1
+        print(f"{delete_idx}. Supprimer un profil")
+        
         print("0. Quitter")
         
         try:
@@ -90,16 +104,40 @@ def choose_profile_menu():
             CURRENT_REGION = None
             print(">>> Mode Auto activé.")
             break
-        elif choice == str(idx):
+        elif choice == str(create_idx):
             name = input("Nom du nouveau profil : ").strip()
             if name:
                 region = select_zone_with_slurp()
                 if region:
                     save_profile(name, region)
                     print(f"Profil '{name}' sauvegardé !")
-                    # La boucle va recommencer et recharger les profils, donc le nouveau sera visible
                 else:
                     print("Sélection annulée.")
+        elif choice == str(delete_idx):
+            print("\n--- SUPPRESSION ---")
+            d_idx = 1
+            d_names = list(profiles.keys())
+            if not d_names:
+                print("Aucun profil à supprimer.")
+                continue
+                
+            for name in d_names:
+                print(f"{d_idx}. {name}")
+                d_idx += 1
+            print("0. Annuler")
+            
+            try:
+                d_choice = input("Profil à supprimer (numéro) : ").strip()
+                if d_choice != "0":
+                    sel = int(d_choice) - 1
+                    if 0 <= sel < len(d_names):
+                        name_to_del = d_names[sel]
+                        if delete_profile(name_to_del):
+                            print(f"Profil '{name_to_del}' supprimé.")
+                    else:
+                        print("Choix invalide.")
+            except ValueError:
+                print("Choix invalide.")
         else:
             try:
                 sel_idx = int(choice) - 2
