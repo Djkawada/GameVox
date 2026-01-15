@@ -31,10 +31,65 @@ else:
 PIPER_BIN = os.path.join(BASE_DIR, "piper_tts/piper/piper")
 PIPER_MODEL = os.path.join(BASE_DIR, "piper_tts/fr_FR-upmc-medium.onnx")
 PROFILES_FILE = os.path.join(BASE_DIR, "profiles.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 # ---------------------
 
 PAUSED = False
 CURRENT_REGION = None # Si None, utilise le mode automatique (bas de l'écran actif)
+
+# Valeurs par défaut (écrasées si config.json existe)
+CONTROLLER_PATH = '/dev/input/event17'
+TOGGLE_BUTTON_CODE = 314
+
+def load_config():
+    global CONTROLLER_PATH, TOGGLE_BUTTON_CODE
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+                CONTROLLER_PATH = config.get('controller_path', CONTROLLER_PATH)
+                TOGGLE_BUTTON_CODE = config.get('toggle_button_code', TOGGLE_BUTTON_CODE)
+                print(f"Configuration chargée : {CONTROLLER_PATH} (Code: {TOGGLE_BUTTON_CODE})")
+        except Exception as e:
+            print(f"Erreur chargement config: {e}")
+
+def save_config(path, code):
+    config = {
+        'controller_path': path,
+        'toggle_button_code': code
+    }
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=4)
+    print("Configuration manette sauvegardée.")
+
+def detect_controller_button():
+    print("\n--- DÉTECTION MANETTE ---")
+    devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+    if not devices:
+        print("Aucun périphérique d'entrée détecté.")
+        return None, None
+    
+    for i, dev in enumerate(devices):
+        print(f"{i}. {dev.name} ({dev.path})")
+    
+    try:
+        idx = int(input("Choisissez le numéro de votre manette : "))
+        if idx < 0 or idx >= len(devices):
+            print("Numéro invalide.")
+            return None, None
+            
+        device = devices[idx]
+        print(f"Appuyez sur le bouton souhaité sur {device.name}...")
+        
+        for event in device.read_loop():
+            if event.type == evdev.ecodes.EV_KEY and event.value == 1: # 1 = pressé
+                print(f"Bouton détecté : {event.code}")
+                return device.path, event.code
+    except KeyboardInterrupt:
+        return None, None
+    except Exception as e:
+        print(f"Erreur : {e}")
+        return None, None
 
 def load_profiles():
     if not os.path.exists(PROFILES_FILE):
@@ -75,7 +130,10 @@ def select_zone_with_slurp():
     return None
 
 def choose_profile_menu():
-    global CURRENT_REGION
+    global CURRENT_REGION, CONTROLLER_PATH, TOGGLE_BUTTON_CODE
+    
+    # Chargement config au démarrage
+    load_config()
     
     while True:
         # On recharge les profils à chaque tour de boucle pour voir les nouveaux
@@ -95,6 +153,9 @@ def choose_profile_menu():
         
         delete_idx = idx + 1
         print(f"{delete_idx}. Supprimer un profil")
+        
+        config_idx = idx + 2
+        print(f"{config_idx}. Configurer la manette (Actuel: {TOGGLE_BUTTON_CODE})")
         
         print("0. Quitter")
         
@@ -143,6 +204,13 @@ def choose_profile_menu():
                         print("Choix invalide.")
             except ValueError:
                 print("Choix invalide.")
+        elif choice == str(config_idx):
+            path, code = detect_controller_button()
+            if path and code:
+                CONTROLLER_PATH = path
+                TOGGLE_BUTTON_CODE = code
+                save_config(path, code)
+                print(f"Manette configurée : {path} (Code {code})")
         else:
             try:
                 sel_idx = int(choice) - 2
