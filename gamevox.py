@@ -22,7 +22,12 @@ CONTROLLER_PATH = '/dev/input/event17' # Votre Zikway HID gamepad
 TOGGLE_BUTTON_CODE = 314               # Le bouton que vous avez choisi
 
 # Chemins absolus pour Piper (nécessaire car lancé depuis venv parfois)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Support pour l'installation AUR (données dans ~/.local/share/gamevox)
+if "GAMEVOX_DATA_DIR" in os.environ:
+    BASE_DIR = os.environ["GAMEVOX_DATA_DIR"]
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 PIPER_BIN = os.path.join(BASE_DIR, "piper_tts/piper/piper")
 PIPER_MODEL = os.path.join(BASE_DIR, "piper_tts/fr_FR-upmc-medium.onnx")
 PROFILES_FILE = os.path.join(BASE_DIR, "profiles.json")
