@@ -12,14 +12,19 @@ import evdev
 import re
 import os
 import shutil
+import termios
+import tty
 
 # --- CONFIGURATION ---
 CHECK_INTERVAL = 1.5
 MIN_TEXT_LENGTH = 3
 LANG = 'fra'
 SIMILARITY_THRESHOLD = 0.5
-CONTROLLER_PATH = '/dev/input/event17' # Votre Zikway HID gamepad
-TOGGLE_BUTTON_CODE = 314               # Le bouton que vous avez choisi
+
+# Valeurs par défaut (écrasées si config.json existe)
+CONTROLLER_PATH = '/dev/input/event17'
+TOGGLE_BUTTON_CODE = 314
+KEYBOARD_TOGGLE_KEY = 'p'
 
 # Chemins absolus pour Piper (nécessaire car lancé depuis venv parfois)
 # Support pour l'installation AUR (données dans ~/.local/share/gamevox)
@@ -37,30 +42,83 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 PAUSED = False
 CURRENT_REGION = None # Si None, utilise le mode automatique (bas de l'écran actif)
 
-# Valeurs par défaut (écrasées si config.json existe)
-CONTROLLER_PATH = '/dev/input/event17'
-TOGGLE_BUTTON_CODE = 314
-
 def load_config():
-    global CONTROLLER_PATH, TOGGLE_BUTTON_CODE
+    global CONTROLLER_PATH, TOGGLE_BUTTON_CODE, KEYBOARD_TOGGLE_KEY
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
                 CONTROLLER_PATH = config.get('controller_path', CONTROLLER_PATH)
                 TOGGLE_BUTTON_CODE = config.get('toggle_button_code', TOGGLE_BUTTON_CODE)
-                print(f"Configuration chargée : {CONTROLLER_PATH} (Code: {TOGGLE_BUTTON_CODE})")
+                KEYBOARD_TOGGLE_KEY = config.get('keyboard_toggle_key', KEYBOARD_TOGGLE_KEY)
+                print(f"Configuration chargée : Manette {TOGGLE_BUTTON_CODE} | Clavier '{KEYBOARD_TOGGLE_KEY}'")
         except Exception as e:
             print(f"Erreur chargement config: {e}")
 
-def save_config(path, code):
-    config = {
-        'controller_path': path,
-        'toggle_button_code': code
-    }
+def save_config(ctrl_path=None, ctrl_code=None, kb_key=None):
+    # On charge l'existant pour ne pas écraser l'autre config
+    current_config = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                current_config = json.load(f)
+        except:
+            pass
+            
+    if ctrl_path and ctrl_code:
+        current_config['controller_path'] = ctrl_path
+        current_config['toggle_button_code'] = ctrl_code
+    
+    if kb_key:
+        current_config['keyboard_toggle_key'] = kb_key
+
     with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=4)
-    print("Configuration manette sauvegardée.")
+        json.dump(current_config, f, indent=4)
+    print("Configuration sauvegardée.")
+
+def detect_keyboard_key():
+    print("\n--- DÉTECTION CLAVIER ---")
+    print("Appuyez sur la touche souhaitée pour PAUSE/LECTURE...")
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+        while True:
+            if sys.stdin.select([sys.stdin], [], [], 0.1)[0]:
+                key = sys.stdin.read(1)
+                # On ignore Entrée (souvent \n ou \r) si ça vient de la sélection précédente
+                if key in ['\n', '\r', ' ']: 
+                    continue
+                print(f"Touche détectée : '{key}'")
+                return key
+    except Exception as e:
+        print(f"Erreur detection clavier: {e}")
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+def keyboard_listener():
+    """Écoute le clavier pour la pause."""
+    fd = sys.stdin.fileno()
+    try:
+        old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(sys.stdin.fileno())
+        
+        while True:
+            if sys.stdin.select([sys.stdin], [], [], 0.1)[0]:
+                key = sys.stdin.read(1)
+                if key.lower() == KEYBOARD_TOGGLE_KEY.lower():
+                    toggle_pause()
+                if key == '\x03': # Ctrl+C
+                    os.kill(os.getpid(), signal.SIGINT)
+                    break
+    except Exception:
+        pass
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except:
+            pass
 
 def detect_controller_button():
     print("\n--- DÉTECTION MANETTE ---")
@@ -94,6 +152,10 @@ def detect_controller_button():
         device = devices[idx]
         print(f"\n>>> Appuyez sur le bouton souhaité sur {device.name}...")
         
+        # Vider les événements en attente pour éviter les faux positifs
+        while device.read_one() is not None:
+            pass
+            
         for event in device.read_loop():
             if event.type == evdev.ecodes.EV_KEY and event.value == 1: # 1 = pressé
                 print(f"Bouton détecté ! Code : {event.code}")
@@ -130,7 +192,7 @@ def delete_profile(name):
     return False
 
 def select_zone_with_slurp():
-    print("Sélectionnez une zone à l'écran avec votre souris...", flush=True)
+    print("Sélectionnez une zone à l\'écran avec votre souris...", flush=True)
     try:
         # slurp permet de sélectionner une zone et retourne "x,y wxh"
         # On ajoute -d pour ne pas lancer la commande si on annule
@@ -138,13 +200,13 @@ def select_zone_with_slurp():
         if res.returncode == 0:
             return res.stdout.strip()
     except FileNotFoundError:
-        print("Erreur: 'slurp' n'est pas installé. Installez-le avec 'sudo pacman -S slurp'", flush=True)
+        print("Erreur: 'slurp' n\'est pas installé. Installez-le avec 'sudo pacman -S slurp'", flush=True)
     except Exception as e:
         print(f"Erreur lors de la sélection : {e}", flush=True)
     return None
 
 def choose_profile_menu():
-    global CURRENT_REGION, CONTROLLER_PATH, TOGGLE_BUTTON_CODE
+    global CURRENT_REGION, CONTROLLER_PATH, TOGGLE_BUTTON_CODE, KEYBOARD_TOGGLE_KEY
     
     # Chargement config au démarrage
     load_config()
@@ -154,7 +216,7 @@ def choose_profile_menu():
         profiles = load_profiles()
         
         print("\n=== MENU DE DÉMARRAGE ===")
-        print("1. Mode Auto (Bas de l'écran actif)")
+        print("1. Mode Auto (Bas de l\'écran actif)")
         
         idx = 2
         profile_names = list(profiles.keys())
@@ -164,12 +226,18 @@ def choose_profile_menu():
             
         create_idx = idx
         print(f"{create_idx}. Créer un nouveau profil")
+        idx += 1
         
-        delete_idx = idx + 1
+        delete_idx = idx
         print(f"{delete_idx}. Supprimer un profil")
+        idx += 1
         
-        config_idx = idx + 2
-        print(f"{config_idx}. Configurer la manette (Actuel: {TOGGLE_BUTTON_CODE})")
+        config_ctrl_idx = idx
+        print(f"{config_ctrl_idx}. Configurer Manette (Actuel: {TOGGLE_BUTTON_CODE})")
+        idx += 1
+        
+        config_kb_idx = idx
+        print(f"{config_kb_idx}. Configurer Clavier (Actuel: '{KEYBOARD_TOGGLE_KEY}')")
         
         print("0. Quitter")
         
@@ -218,13 +286,21 @@ def choose_profile_menu():
                         print("Choix invalide.")
             except ValueError:
                 print("Choix invalide.")
-        elif choice == str(config_idx):
+        elif choice == str(config_ctrl_idx):
             path, code = detect_controller_button()
             if path and code:
                 CONTROLLER_PATH = path
                 TOGGLE_BUTTON_CODE = code
-                save_config(path, code)
+                save_config(ctrl_path=path, ctrl_code=code)
                 print(f"Manette configurée : {path} (Code {code})")
+        
+        elif choice == str(config_kb_idx):
+            key = detect_keyboard_key()
+            if key:
+                KEYBOARD_TOGGLE_KEY = key
+                save_config(kb_key=key)
+                print(f"Touche clavier configurée : '{key}'")
+                
         else:
             try:
                 sel_idx = int(choice) - 2
@@ -281,7 +357,7 @@ def capture_zone():
         # Mode Profil Fixe
         region = CURRENT_REGION
     else:
-        # Mode Auto (Bas de l'écran)
+        # Mode Auto (Bas de l\'écran)
         geo = get_active_monitor_geometry()
         if geo:
             x = geo['x']
@@ -305,7 +381,7 @@ def clean_text(text):
     # Remplace les retours à la ligne par des espaces
     text = text.replace('\n', ' ')
     # Garde lettres, accents, ponctuation de base ET chiffres
-    text = re.sub(r'[^a-zA-Z0-9àâäéèêëîïôöùûüçÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ\s.,!?:;\'"-]', ' ', text)
+    text = re.sub(r'[^a-zA-Z0-9àâäéèêëîïôöùûüçÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ\s.,!?:;\'")-]', ' ', text)
     # Réduit les espaces multiples
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
@@ -317,7 +393,7 @@ def speak(text):
             
             # Méthode fichier temporaire (100% fiable)
             # Les pipes causent trop de problèmes aléatoires avec mpv/aplay/paplay
-            # Piper est tellement rapide que l'écriture disque est négligeable
+            # Piper est tellement rapide que l\'écriture disque est négligeable
             
             filename = f"/tmp/gamevox_{int(time.time())}_{threading.get_ident()}.wav"
             
@@ -349,9 +425,11 @@ def main():
     
     choose_profile_menu()
     
-    # Lancement de l'écoute manette dans un thread séparé
-    thread = threading.Thread(target=controller_listener, daemon=True)
-    thread.start()
+    # Lancement de l\'écoute manette dans un thread séparé
+    threading.Thread(target=controller_listener, daemon=True).start()
+    
+    # Lancement de l\'écoute clavier
+    threading.Thread(target=keyboard_listener, daemon=True).start()
     
     last_text = ""
     
