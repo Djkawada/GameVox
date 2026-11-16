@@ -9,9 +9,11 @@ import difflib
 import signal
 import threading
 import evdev
-import re
 import os
+import re
+import select
 import shutil
+import tempfile
 import termios
 import tty
 
@@ -41,6 +43,8 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
 PAUSED = False
 CURRENT_REGION = None # Si None, utilise le mode automatique (bas de l'écran actif)
+STOP_EVENT = threading.Event()
+TTS_LOCK = threading.Lock()
 
 def load_config():
     global CONTROLLER_PATH, TOGGLE_BUTTON_CODE, KEYBOARD_TOGGLE_KEY
@@ -72,6 +76,7 @@ def save_config(ctrl_path=None, ctrl_code=None, kb_key=None):
     if kb_key:
         current_config['keyboard_toggle_key'] = kb_key
 
+    os.makedirs(BASE_DIR, exist_ok=True)
     with open(CONFIG_FILE, 'w') as f:
         json.dump(current_config, f, indent=4)
     print("Configuration sauvegardée.")
@@ -79,15 +84,17 @@ def save_config(ctrl_path=None, ctrl_code=None, kb_key=None):
 def detect_keyboard_key():
     print("\n--- DÉTECTION CLAVIER ---")
     print("Appuyez sur la touche souhaitée pour PAUSE/LECTURE...")
+    if not sys.stdin.isatty():
+        return None
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
-        tty.setcbreak(sys.stdin.fileno())
+        tty.setcbreak(fd)
         while True:
-            if sys.stdin.select([sys.stdin], [], [], 0.1)[0]:
+            if select.select([sys.stdin], [], [], 0.1)[0]:
                 key = sys.stdin.read(1)
                 # On ignore Entrée (souvent \n ou \r) si ça vient de la sélection précédente
-                if key in ['\n', '\r', ' ']: 
+                if key in ['\n', '\r', ' ']:
                     continue
                 print(f"Touche détectée : '{key}'")
                 return key
@@ -99,26 +106,31 @@ def detect_keyboard_key():
 
 def keyboard_listener():
     """Écoute le clavier pour la pause."""
+    if not sys.stdin.isatty():
+        return
     fd = sys.stdin.fileno()
+    old_settings = None
     try:
         old_settings = termios.tcgetattr(fd)
-        tty.setcbreak(sys.stdin.fileno())
-        
-        while True:
-            if sys.stdin.select([sys.stdin], [], [], 0.1)[0]:
+        tty.setcbreak(fd)
+
+        while not STOP_EVENT.is_set():
+            if select.select([sys.stdin], [], [], 0.1)[0]:
                 key = sys.stdin.read(1)
                 if key.lower() == KEYBOARD_TOGGLE_KEY.lower():
                     toggle_pause()
                 if key == '\x03': # Ctrl+C
+                    STOP_EVENT.set()
                     os.kill(os.getpid(), signal.SIGINT)
                     break
     except Exception:
         pass
     finally:
-        try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        except:
-            pass
+        if old_settings is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
 
 def detect_controller_button():
     print("\n--- DÉTECTION MANETTE ---")
@@ -179,6 +191,7 @@ def load_profiles():
 def save_profile(name, region):
     profiles = load_profiles()
     profiles[name] = region
+    os.makedirs(BASE_DIR, exist_ok=True)
     with open(PROFILES_FILE, 'w') as f:
         json.dump(profiles, f, indent=4)
 
@@ -328,16 +341,26 @@ def speak_system(text):
     speak(text)
 
 def controller_listener():
-    """Écoute la manette en arrière-plan."""
-    try:
-        device = evdev.InputDevice(CONTROLLER_PATH)
-        print(f"Écoute de la manette : {device.name}", flush=True)
-        for event in device.read_loop():
-            if event.type == evdev.ecodes.EV_KEY:
-                if event.code == TOGGLE_BUTTON_CODE and event.value == 1: # 1 = pressé
-                    toggle_pause()
-    except Exception as e:
-        print(f"Erreur manette : {e}", flush=True)
+    """Écoute la manette en arrière-plan (avec reconnexion automatique)."""
+    logged_error = False
+    while not STOP_EVENT.is_set():
+        try:
+            device = evdev.InputDevice(CONTROLLER_PATH)
+            print(f"Écoute de la manette : {device.name}", flush=True)
+            logged_error = False
+            while not STOP_EVENT.is_set():
+                r, _, _ = select.select([device.fd], [], [], 0.5)
+                if not r:
+                    continue
+                for event in device.read():
+                    if event.type == evdev.ecodes.EV_KEY:
+                        if event.code == TOGGLE_BUTTON_CODE and event.value == 1: # 1 = pressé
+                            toggle_pause()
+        except Exception as e:
+            if not logged_error and not STOP_EVENT.is_set():
+                print(f"Erreur manette : {e}", flush=True)
+                logged_error = True
+            STOP_EVENT.wait(3.0)
 
 def get_active_monitor_geometry():
     try:
@@ -388,73 +411,88 @@ def clean_text(text):
 
 def speak(text):
     def _speak_thread(t):
-        try:
-            print(f"PARLE: {t}", flush=True)
-            
-            # Méthode fichier temporaire (100% fiable)
-            # Les pipes causent trop de problèmes aléatoires avec mpv/aplay/paplay
-            # Piper est tellement rapide que l\'écriture disque est négligeable
-            
-            filename = f"/tmp/gamevox_{int(time.time())}_{threading.get_ident()}.wav"
-            
-            # 1. Générer le fichier WAV avec Piper
-            with open(filename, 'wb') as f:
-                p_piper = subprocess.Popen(
-                    [PIPER_BIN, '--model', PIPER_MODEL, '--output_file', '-'],
-                    stdin=subprocess.PIPE,
-                    stdout=f,
-                    stderr=subprocess.DEVNULL
-                )
-                p_piper.communicate(input=t.encode('utf-8'))
-            
-            # 2. Jouer le fichier avec mpv (ou paplay)
-            if os.path.getsize(filename) > 0:
-                subprocess.run(['paplay', filename], stderr=subprocess.DEVNULL)
-            
-            # 3. Nettoyer
-            if os.path.exists(filename):
-                os.remove(filename)
-            
-        except Exception as e:
-            print(f"Erreur TTS (Piper): {e}", flush=True)
+        filename = None
+        with TTS_LOCK:
+            try:
+                print(f"PARLE: {t}", flush=True)
+
+                with tempfile.NamedTemporaryFile(prefix="gamevox_", suffix=".wav", delete=False) as tmp:
+                    filename = tmp.name
+
+                # 1. Générer le fichier WAV avec Piper
+                with open(filename, 'wb') as f:
+                    p_piper = subprocess.Popen(
+                        [PIPER_BIN, '--model', PIPER_MODEL, '--output_file', '-'],
+                        stdin=subprocess.PIPE,
+                        stdout=f,
+                        stderr=subprocess.DEVNULL
+                    )
+                    p_piper.communicate(input=t.encode('utf-8'))
+
+                # 2. Jouer le fichier avec paplay
+                if os.path.exists(filename) and os.path.getsize(filename) > 0:
+                    subprocess.run(['paplay', filename], stderr=subprocess.DEVNULL)
+
+            except Exception as e:
+                print(f"Erreur TTS (Piper): {e}", flush=True)
+            finally:
+                if filename and os.path.exists(filename):
+                    try:
+                        os.remove(filename)
+                    except OSError:
+                        pass
 
     threading.Thread(target=_speak_thread, args=(text,), daemon=True).start()
 
 def main():
     print("=== GAMEVOX AVEC MANETTE ===", flush=True)
-    
+
     choose_profile_menu()
-    
-    # Lancement de l\'écoute manette dans un thread séparé
-    threading.Thread(target=controller_listener, daemon=True).start()
-    
-    # Lancement de l\'écoute clavier
-    threading.Thread(target=keyboard_listener, daemon=True).start()
-    
+
+    orig_termios = None
+    if sys.stdin.isatty():
+        try:
+            orig_termios = termios.tcgetattr(sys.stdin.fileno())
+        except Exception:
+            pass
+
+    # Lancement de l'écoute manette et clavier dans des threads séparés
+    ctrl_thread = threading.Thread(target=controller_listener, daemon=True)
+    kb_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    ctrl_thread.start()
+    kb_thread.start()
+
     last_text = ""
-    
+
     try:
-        while True:
+        while not STOP_EVENT.is_set():
             if PAUSED:
-                time.sleep(0.5)
+                STOP_EVENT.wait(0.5)
                 continue
 
             # Capture selon le mode choisi (Zone fixe ou Auto)
             img = capture_zone()
-            
+
             if img:
                 text = pytesseract.image_to_string(img.convert('L'), lang=LANG)
                 cleaned = clean_text(text)
-                
+
                 if len(cleaned) >= MIN_TEXT_LENGTH:
                     sim = difflib.SequenceMatcher(None, last_text, cleaned).ratio()
                     if sim < SIMILARITY_THRESHOLD:
                         speak(cleaned)
                         last_text = cleaned
-            
-            time.sleep(CHECK_INTERVAL)
+
+            STOP_EVENT.wait(CHECK_INTERVAL)
     except KeyboardInterrupt:
         print("Arrêt.")
+    finally:
+        STOP_EVENT.set()
+        if orig_termios is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, orig_termios)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
